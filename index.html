@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>NEON ASTEROIDS</title>
+<style>
+  :root{
+    --cyan:#38bdf8; --magenta:#ff3ea5; --green:#7CFF7C; --white:#e8fbff; --bg:#05070d;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:var(--bg);}
+  body{font-family:"Courier New",ui-monospace,monospace;color:var(--white);touch-action:none;user-select:none;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;width:100%;height:100%;background:var(--bg);}
+  #hud{position:fixed;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:flex-start;padding:10px 14px;pointer-events:none;font-size:clamp(13px,2.6vw,20px);letter-spacing:2px;text-transform:uppercase;text-shadow:0 0 6px var(--cyan),0 0 14px rgba(56,189,248,.55);z-index:5;}
+  #hud .col{display:flex;flex-direction:column;gap:2px;}
+  #hud .col.right{align-items:flex-end;}
+  #canary{font-size:10px;letter-spacing:1px;opacity:.55;text-shadow:0 0 5px var(--magenta);color:var(--magenta);}
+  .val{color:var(--cyan);font-weight:bold;}
+  #touch{position:fixed;inset:0;z-index:8;display:none;pointer-events:none;}
+  #touch button{position:absolute;pointer-events:auto;width:23vw;height:23vw;max-width:96px;max-height:96px;min-width:48px;min-height:48px;border-radius:50%;background:rgba(56,189,248,.06);border:2px solid rgba(56,189,248,.5);color:var(--cyan);font-family:inherit;font-size:clamp(18px,5vw,28px);font-weight:bold;text-shadow:0 0 8px var(--cyan);box-shadow:0 0 12px rgba(56,189,248,.35) inset;display:flex;align-items:center;justify-content:center;-webkit-user-select:none;user-select:none;}
+  #touch button:active{background:rgba(56,189,248,.28);box-shadow:0 0 22px var(--cyan);}
+  #bLeft{left:14px;bottom:14px;}
+  #bRight{left:min(calc(14px + 26vw),112px);bottom:14px;}
+  #bFire{right:14px;bottom:14px;}
+  #bThrust{right:14px;bottom:min(calc(14px + 26vw),112px);}
+  #bHyper{right:14px;left:auto;bottom:auto;top:14px;}
+  @media (min-width:820px){#touch{display:none!important;}}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="hud">
+  <div class="col">
+    <div>Score <span class="val" id="score">0</span></div>
+    <div id="canary">NEXUS-M845AV</div>
+  </div>
+  <div class="col right">
+    <div>Wave <span class="val" id="wave">1</span></div>
+    <div>Lives <span class="val" id="lives">3</span></div>
+  </div>
+</div>
+<div id="touch">
+  <button id="bLeft">&#8630;</button>
+  <button id="bRight">&#8631;</button>
+  <button id="bThrust">&#9650;</button>
+  <button id="bFire">&#9679;</button>
+  <button id="bHyper">&#10022;</button>
+</div>
+<script>
+"use strict";
+/* =====================================================================
+   NEON ASTEROIDS — vector wireframe space shooter
+   Canary: NEXUS-M845AV
+   ===================================================================== */
+const CANARY = "NEXUS-M845AV";
+
+/* ---------- canvas / sizing ---------- */
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+const LITE = (window.innerWidth < 820) || ((navigator.hardwareConcurrency||8) <= 4);
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, window.innerWidth < 820 ? 1.5 : 2);
+  W = cv.clientWidth || window.innerWidth;
+  H = cv.clientHeight || window.innerHeight;
+  cv.width  = Math.floor(W * DPR);
+  cv.height = Math.floor(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize);
+
+/* ---------- helpers ---------- */
+const TAU = Math.PI * 2;
+function rand(a, b){ return a + Math.random() * (b - a); }
+function wrap(o){
+  // toroidal screen wrap preserving velocity
+  if (o.x < 0) o.x += W; else if (o.x >= W) o.x -= W;
+  if (o.y < 0) o.y += H; else if (o.y >= H) o.y -= H;
+}
+function dist2(ax, ay, bx, by){ const dx = ax-bx, dy = ay-by; return dx*dx + dy*dy; }
+function finite(v){ return typeof v === "number" && isFinite(v); }
+
+/* ---------- game state ---------- */
+const STATE = { TITLE:0, PLAYING:1, DEAD:2, WAVEGAP:3, GAMEOVER:4 };
+let state = STATE.TITLE;
+let score = 0, lives = 3, wave = 1, stateTimer = 0;
+let bullets = [], rocks = [], saucers = [], particles = [];
+let canaryEl = document.getElementById("canary");
+canaryEl.textContent = CANARY;
+
+/* ---------- ship ---------- */
+const ship = {
+  x:0, y:0, vx:0, vy:0, a:-Math.PI/2, r:12,
+  thrusting:false, cool:0, invuln:0, alive:true, trail:[]
+};
+
+/* ---------- input ---------- */
+const keys = {};
+window.addEventListener("keydown", e=>{ keys[e.code]=true;
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault();
+  if (e.code==="Space" && (state===STATE.TITLE||state===STATE.GAMEOVER)) startGame();
+  if (e.code==="KeyH" || e.code==="ShiftLeft") hyperspace();
+});
+window.addEventListener("keyup", e=>{ keys[e.code]=false; });
+
+/* touch buttons */
+function bindHold(id, on, off){
+  const el = document.getElementById(id);
+  const down = e=>{ e.preventDefault(); on(); };
+  const up   = e=>{ e.preventDefault(); if(off) off(); };
+  el.addEventListener("touchstart", down, {passive:false});
+  el.addEventListener("touchend", up, {passive:false});
+  el.addEventListener("mousedown", down);
+  el.addEventListener("mouseup", up);
+  el.addEventListener("mouseleave", up);
+}
+let tLeft=false, tRight=false, tThrust=false;
+bindHold("bLeft",  ()=>tLeft=true,  ()=>tLeft=false);
+bindHold("bRight", ()=>tRight=true, ()=>tRight=false);
+bindHold("bThrust",()=>tThrust=true,()=>tThrust=false);
+bindHold("bFire",  ()=>fire());
+bindHold("bHyper", ()=>hyperspace());
+function syncTouchVisibility(){
+  const touchEl = document.getElementById("touch");
+  touchEl.style.display = (window.innerWidth < 820) ? "block" : "none";
+}
+syncTouchVisibility();
+window.addEventListener("resize", syncTouchVisibility);
+
+/* ---------- spawning ---------- */
+function spawnRocks(n){
+  for(let i=0;i<n;i++){
+    // spawn away from ship center
+    let x, y, tries=0;
+    do { x = rand(0,W); y = rand(0,H); tries++; }
+    while (dist2(x,y,ship.x,ship.y) < 200*200 && tries < 20);
+    const ang = rand(0, TAU);
+    const spd = rand(20, 55) * (LITE?0.85:1);
+    rocks.push(makeRock(x, y, 3, Math.cos(ang)*spd, Math.sin(ang)*spd));
+  }
+}
+function makeRock(x, y, tier, vx, vy){
+  const radii = {3:60, 2:34, 1:18};
+  const r = radii[tier];
+  const n = 8 + (Math.random()*4|0);
+  const shape = [];
+  for(let i=0;i<n;i++) shape.push(rand(r*0.72, r*1.15));
+  return { x, y, vx, vy, r, tier, shape, ang:0, spin:rand(-0.6,0.6) };
+}
+function spawnSaucer(){
+  const small = Math.random() < (0.35 + wave*0.03);
+  const r = small ? 14 : 24;
+  const fromLeft = Math.random() < 0.5;
+  const y = rand(H*0.15, H*0.85);
+  saucers.push({
+    x: fromLeft ? -r : W + r, y,
+    vx: (fromLeft ? 1 : -1) * (small ? 110 : 80),
+    vy: rand(-25,25),
+    r, small, cool: rand(0.6,1.4)
+  });
+}
+
+/* ---------- player actions ---------- */
+function fire(){
+  if (state !== STATE.PLAYING || !ship.alive) return;
+  if (ship.cool > 0) return;
+  ship.cool = 0.16;
+  const sp = 520;
+  bullets.push({
+    x: ship.x + Math.cos(ship.a)*ship.r,
+    y: ship.y + Math.sin(ship.a)*ship.r,
+    vx: Math.cos(ship.a)*sp + ship.vx*0.5,
+    vy: Math.sin(ship.a)*sp + ship.vy*0.5,
+    life: 1.05, r: 2
+  });
+}
+function hyperspace(){
+  if (state !== STATE.PLAYING || !ship.alive) return;
+  ship.x = rand(0,W); ship.y = rand(0,H);
+  ship.vx = ship.vy = 0;
+  ship.trail.length = 0;
+  if (Math.random() < 1/6){ ship.alive = false; } // 1-in-6 self-destruct
+}
+
+/* ---------- particles ---------- */
+function burst(x, y, color, n){
+  for(let i=0;i<n;i++){
+    const a = rand(0,TAU), s = rand(30,180);
+    particles.push({ x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:rand(0.25,0.7), max:0.7, color });
+  }
+}
+
+/* ---------- splitting ---------- */
+function splitRock(rock){
+  score += rock.tier===3 ? 20 : rock.tier===2 ? 50 : 100;
+  const col = rock.tier===3 ? "#7CFF7C" : "#38bdf8";
+  burst(rock.x, rock.y, col, rock.tier===3 ? 14 : 9);
+  if (rock.tier > 1){
+    const nt = rock.tier - 1;
+    for(let i=0;i<2;i++){
+      const ang = rand(0,TAU), s = rand(45, 90) * (4-nt);
+      rocks.push(makeRock(rock.x, rock.y, nt, Math.cos(ang)*s, Math.sin(ang)*s));
+    }
+  }
+}
+
+/* ---------- update ---------- */
+function update(dt){
+  stateTimer -= dt;
+
+  // --- ship ---
+  if (ship.alive && state === STATE.PLAYING){
+    const rot = 3.6 * dt;
+    if (keys["ArrowLeft"] || tLeft)  ship.a -= rot;
+    if (keys["ArrowRight"]|| tRight) ship.a += rot;
+    ship.thrusting = !!(keys["ArrowUp"] || tThrust);
+    if (ship.thrusting){
+      const acc = 240;
+      ship.vx += Math.cos(ship.a)*acc*dt;
+      ship.vy += Math.sin(ship.a)*acc*dt;
+    }
+    // mild drag (near Spacewar inertia)
+    const drag = Math.pow(0.6, dt);
+    ship.vx *= drag; ship.vy *= drag;
+    if (!finite(ship.vx)) ship.vx = 0;
+    if (!finite(ship.vy)) ship.vy = 0;
+    // speed cap
+    const sp = Math.hypot(ship.vx, ship.vy);
+    const MAX = 420;
+    if (sp > MAX){ ship.vx = ship.vx/sp*MAX; ship.vy = ship.vy/sp*MAX; }
+
+    ship.x += ship.vx*dt; ship.y += ship.vy*dt;
+    wrap(ship);
+    ship.cool = Math.max(0, ship.cool - dt);
+    if (ship.invuln > 0) ship.invuln -= dt;
+
+    // trail buffer (bounded)
+    ship.trail.push({x:ship.x, y:ship.y});
+    if (ship.trail.length > 22) ship.trail.shift();
+  } else if (ship.alive && state === STATE.WAVEGAP){
+    ship.x += ship.vx*dt; ship.y += ship.vy*dt; wrap(ship);
+  }
+
+  // --- bullets ---
+  for (let i=bullets.length-1;i>=0;i--){
+    const b = bullets[i];
+    b.x += b.vx*dt; b.y += b.vy*dt; b.life -= dt;
+    wrap(b);
+    if (b.life <= 0) bullets.splice(i,1);
+  }
+
+  // --- asteroids ---
+  for (let i=rocks.length-1;i>=0;i--){
+    const rk = rocks[i];
+    rk.x += rk.vx*dt; rk.y += rk.vy*dt; rk.ang += rk.spin*dt;
+    wrap(rk);
+  }
+
+  // --- saucers ---
+  for (let i=saucers.length-1;i>=0;i--){
+    const s = saucers[i];
+    s.x += s.vx*dt; s.y += s.vy*dt;
+    if (s.y < 20 || s.y > H-20) s.vy *= -1;
+    // saucer firing
+    if (state === STATE.PLAYING && ship.alive){
+      s.cool -= dt;
+      if (s.cool <= 0){
+        s.cool = s.small ? rand(0.7,1.2) : rand(1.1,2.0);
+        let aim;
+        if (s.small){
+          // predictive leading shot
+          const t = 0.35;
+          const px = ship.x + ship.vx*t, py = ship.y + ship.vy*t;
+          aim = Math.atan2(py - s.y, px - s.x);
+        } else {
+          aim = Math.atan2(ship.y - s.y, ship.x - s.x) + rand(-0.35,0.35);
+        }
+        const bs = 300;
+        bullets.push({ x:s.x, y:s.y, vx:Math.cos(aim)*bs, vy:Math.sin(aim)*bs, life:1.4, r:2, hostile:true });
+      }
+    }
+    if (s.x < -40 || s.x > W+40) saucers.splice(i,1);
+  }
+
+  // --- particles ---
+  for (let i=particles.length-1;i>=0;i--){
+    const p = particles[i];
+    p.x += p.vx*dt; p.y += p.vy*dt; p.life -= dt;
+    if (p.life <= 0) particles.splice(i,1);
+  }
+
+  // --- collisions (only while playing) ---
+  if (state === STATE.PLAYING){
+    // bullets vs rocks
+    for (let i=bullets.length-1;i>=0;i--){
+      const b = bullets[i];
+      if (b.hostile) continue;
+      for (let j=rocks.length-1;j>=0;j--){
+        const rk = rocks[j];
+        const rr = rk.r;
+        if (dist2(b.x,b.y,rk.x,rk.y) < rr*rr){
+          splitRock(rk); rocks.splice(j,1); bullets.splice(i,1); break;
+        }
+      }
+    }
+    // bullets vs saucers
+    for (let i=bullets.length-1;i>=0;i--){
+      const b = bullets[i];
+      if (b.hostile) continue;
+      for (let j=saucers.length-1;j>=0;j--){
+        const s = saucers[j];
+        if (dist2(b.x,b.y,s.x,s.y) < s.r*s.r){
+          score += s.small ? 1000 : 200;
+          burst(s.x,s.y,"#ff3ea5",16);
+          saucers.splice(j,1); bullets.splice(i,1); break;
+        }
+      }
+    }
+    // hostile bullets vs ship
+    if (ship.alive && ship.invuln <= 0){
+      for (let i=bullets.length-1;i>=0;i--){
+        const b = bullets[i];
+        if (!b.hostile) continue;
+        if (dist2(b.x,b.y,ship.x,ship.y) < ship.r*ship.r){ bullets.splice(i,1); killShip(); break; }
+      }
+    }
+    // rocks vs ship
+    if (ship.alive && ship.invuln <= 0){
+      for (const rk of rocks){
+        const rr = rk.r + ship.r;
+        if (dist2(rk.x,rk.y,ship.x,ship.y) < rr*rr){ killShip(); break; }
+      }
+    }
+    // saucer vs ship
+    if (ship.alive && ship.invuln <= 0){
+      for (const s of saucers){
+        const rr = s.r + ship.r;
+        if (dist2(s.x,s.y,ship.x,ship.y) < rr*rr){ killShip(); break; }
+      }
+    }
+    // saucer vs rock (saucers get destroyed)
+    for (let i=saucers.length-1;i>=0;i--){
+      const s = saucers[i];
+      for (let j=rocks.length-1;j>=0;j--){
+        const rk = rocks[j];
+        const rr = s.r + rk.r;
+        if (dist2(s.x,s.y,rk.x,rk.y) < rr*rr){ burst(s.x,s.y,"#ff3ea5",12); saucers.splice(i,1); break; }
+      }
+    }
+
+    // extra life
+    if (score >= wave*10000 && score < wave*10000 + 100){ lives++; }
+  }
+
+  // --- wave clear ---
+  if (state === STATE.PLAYING && rocks.length === 0 && saucers.length === 0){
+    state = STATE.WAVEGAP; stateTimer = 1.4;
+  }
+  if (state === STATE.WAVEGAP && stateTimer <= 0){
+    wave++;
+    spawnRocks(Math.min(4 + wave, 12));
+    if (wave >= 2 && Math.random() < 0.7) spawnSaucer();
+    state = STATE.PLAYING;
+  }
+
+  // --- death / respawn ---
+  if (state === STATE.DEAD && stateTimer <= 0){
+    if (lives <= 0){ state = STATE.GAMEOVER; stateTimer = 2.0; }
+    else { respawn(); state = STATE.PLAYING; }
+  }
+  if (state === STATE.GAMEOVER && stateTimer <= 0){
+    state = STATE.TITLE;
+  }
+
+  // random saucer cadence during play
+  if (state === STATE.PLAYING && saucers.length === 0 && Math.random() < 0.0016){
+    spawnSaucer();
+  }
+
+  updateHUD();
+}
+
+function killShip(){
+  ship.alive = false;
+  burst(ship.x, ship.y, "#38bdf8", 22);
+  lives--;
+  state = STATE.DEAD; stateTimer = 1.6;
+}
+function respawn(){
+  ship.x = W/2; ship.y = H/2; ship.vx = 0; ship.vy = 0; ship.a = -Math.PI/2;
+  ship.alive = true; ship.invuln = 2.0; ship.trail.length = 0;
+}
+function startGame(){
+  score = 0; lives = 3; wave = 1; state = STATE.PLAYING;
+  bullets = []; rocks = []; saucers = []; particles = [];
+  respawn();
+  spawnRocks(4);
+}
+function updateHUD(){
+  document.getElementById("score").textContent = score;
+  document.getElementById("wave").textContent = wave;
+  document.getElementById("lives").textContent = Math.max(0, lives);
+}
+
+/* ---------- render ---------- */
+function stroke(points, color, width, closed){
+  ctx.beginPath();
+  for(let i=0;i<points.length;i++){
+    const p = points[i];
+    if (i===0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+  }
+  if (closed) ctx.closePath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.stroke();
+}
+function glowStroke(points, color, width, closed){
+  // cheap neon glow: one wide low-alpha pass + one crisp pass (no shadowBlur)
+  ctx.globalAlpha = 0.22;
+  stroke(points, color, width*3.2, closed);
+  ctx.globalAlpha = 1;
+  stroke(points, color, width, closed);
+}
+
+function drawShip(){
+  if (!ship.alive) return;
+  const blink = ship.invuln > 0 && (Math.floor(performance.now()/90) % 2 === 0);
+  if (blink) return;
+  const c = Math.cos(ship.a), s = Math.sin(ship.a);
+  const nose = [ship.x + c*ship.r, ship.y + s*ship.r];
+  const lw = [ship.x + c*(-ship.r*0.7) - s*(-ship.r*0.8), ship.y + s*(-ship.r*0.7) + c*(-ship.r*0.8)];
+  const rw = [ship.x + c*(-ship.r*0.7) + s*(-ship.r*0.8), ship.y + s*(-ship.r*0.7) - c*(-ship.r*0.8)];
+  glowStroke([nose, lw, rw], "#38bdf8", 2, true);
+  // thrust flame
+  if (ship.thrusting && Math.random() < 0.7){
+    const fb = [ship.x + c*(-ship.r*1.1), ship.y + s*(-ship.r*1.1)];
+    const l2 = [ship.x + c*(-ship.r*1.9) - s*(-ship.r*0.5), ship.y + s*(-ship.r*1.9) + c*(-ship.r*0.5)];
+    const r2 = [ship.x + c*(-ship.r*1.9) + s*(-ship.r*0.5), ship.y + s*(-ship.r*1.9) - c*(-ship.r*0.5)];
+    stroke([fb, l2, r2], "#ff9d3e", 2, true);
+  }
+}
+function drawTrail(){
+  if (ship.trail.length < 2) return;
+  for (let i=1;i<ship.trail.length;i++){
+    const a = i / ship.trail.length;
+    ctx.globalAlpha = a * 0.35;
+    ctx.beginPath();
+    ctx.moveTo(ship.trail[i-1].x, ship.trail[i-1].y);
+    ctx.lineTo(ship.trail[i].x, ship.trail[i].y);
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawRocks(){
+  const cols = {3:"#7CFF7C", 2:"#5ee0ff", 1:"#c9f5ff"};
+  for (const rk of rocks){
+    const pts = [];
+    const n = rk.shape.length;
+    for (let i=0;i<n;i++){
+      const ang = rk.ang + i/n*TAU;
+      const rr = rk.shape[i];
+      pts.push([rk.x + Math.cos(ang)*rr, rk.y + Math.sin(ang)*rr]);
+    }
+    glowStroke(pts, cols[rk.tier], 1.8, true);
+  }
+}
+function drawSaucers(){
+  for (const s of saucers){
+    const w = s.r, h = s.r*0.55;
+    const body = [
+      [s.x-w, s.y], [s.x-w*0.5, s.y-h], [s.x+w*0.5, s.y-h],
+      [s.x+w, s.y], [s.x+w*0.5, s.y+h], [s.x-w*0.5, s.y+h]
+    ];
+    glowStroke(body, "#ff3ea5", 1.8, true);
+    stroke([[s.x-w*0.35, s.y-h], [s.x+w*0.35, s.y-h]], "#ff3ea5", 1.4, false);
+  }
+}
+function drawBullets(){
+  for (const b of bullets){
+    if (b.hostile) glowStroke([[b.x-3,b.y],[b.x+3,b.y]], "#ff3ea5", 2, false);
+    else glowStroke([[b.x-3,b.y],[b.x+3,b.y]], "#e8fbff", 2, false);
+  }
+}
+function drawParticles(){
+  for (const p of particles){
+    const a = Math.max(0, p.life / p.max);
+    ctx.globalAlpha = a;
+    glowStroke([[p.x-2,p.y-2],[p.x+2,p.y+2]], p.color, 1.4, false);
+  }
+  ctx.globalAlpha = 1;
+}
+function centerText(lines, size){
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (let i=0;i<lines.length;i++){
+    const l = lines[i];
+    ctx.font = (l.bold ? "bold " : "") + (l.size||size) + "px 'Courier New', monospace";
+    ctx.globalAlpha = 0.22;
+    ctx.fillStyle = l.color || "#38bdf8";
+    ctx.fillText(l.t, W/2, H/2 + l.dy + 2);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = l.color || "#38bdf8";
+    ctx.fillText(l.t, W/2, H/2 + l.dy);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw(){
+  // clear (no per-frame resize!)
+  ctx.fillStyle = "#05070d";
+  ctx.fillRect(0, 0, W, H);
+
+  drawTrail();
+  drawRocks();
+  drawSaucers();
+  drawBullets();
+  drawShip();
+  drawParticles();
+
+  if (state === STATE.TITLE){
+    centerText([
+      {t:"NEON ASTEROIDS", size:44, bold:true, color:"#38bdf8", dy:-40},
+      {t:"Arrow keys rotate / thrust", size:16, color:"#94a3b8", dy:10},
+      {t:"SPACE fire   \u2022   SHIFT hyperspace", size:16, color:"#94a3b8", dy:34},
+      {t:"PRESS SPACE TO START", size:18, bold:true, color:"#7CFF7C", dy:80}
+    ], 16);
+  }
+  if (state === STATE.GAMEOVER){
+    centerText([
+      {t:"GAME OVER", size:44, bold:true, color:"#ff3ea5", dy:-30},
+      {t:"SCORE " + score, size:20, color:"#e8fbff", dy:30}
+    ], 18);
+  }
+  if (state === STATE.WAVEGAP){
+    centerText([{t:"WAVE " + (wave+1), size:34, bold:true, color:"#7CFF7C", dy:0}], 24);
+  }
+}
+
+/* ---------- loop (fixed timestep) ---------- */
+let last = performance.now(), acc = 0;
+const STEP = 1/60;
+function loop(now){
+  requestAnimationFrame(loop);
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.1) dt = 0.1;
+  acc += dt;
+  let iters = 0;
+  while (acc >= STEP && iters < 5){ update(STEP); acc -= STEP; iters++; }
+  draw();
+}
+
+/* ---------- boot ---------- */
+resize();
+ship.x = W/2; ship.y = H/2;
+updateHUD();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
